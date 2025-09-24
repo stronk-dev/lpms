@@ -4,6 +4,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavfilter/buffersrc.h>
 #include <libavfilter/buffersink.h>
+#include <libavutil/log.h>
 
 static int add_video_stream(struct output_ctx *octx, struct input_ctx *ictx)
 {
@@ -581,11 +582,19 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
 
   if (!filter || !filter->active) {
     // No filter in between decoder and encoder, so use input frame directly
+    // Track decoded video frames seen for this output
+    if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type && inf && inf->width && inf->height) {
+      octx->dec_video_frames++;
+    }
     return encode(encoder, inf, octx, ost);
   }
 
   int is_video = (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type);
   int is_audio = (AVMEDIA_TYPE_AUDIO == ost->codecpar->codec_type);
+  // Track decoded video frames seen for this output when feeding the graph
+  if (is_video && inf && inf->width && inf->height) {
+    octx->dec_video_frames++;
+  }
   ret = filtergraph_write(inf, ictx, octx, filter, is_video);
   if (ret < 0) goto proc_cleanup;
 
@@ -663,6 +672,31 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
 
       ret = encode(encoder, frame, octx, ost);
 
+      // Guardrail: abort if encoded frames greatly exceed decoded frames
+      if (is_video) {
+        int64_t dec = octx->dec_video_frames;
+        int64_t enc = octx->res ? octx->res->frames : 0;
+        // Allow generous headroom; trip only on extreme duplication
+        int64_t dup_excess_limit = 10000; // consistent with fps-dup guard
+        if (enc - dec > dup_excess_limit) {
+          av_log(NULL, AV_LOG_ERROR,
+                 "Aborting due to excess encoded vs decoded frames: encoded=%lld decoded=%lld excess=%lld limit=%lld out=%s\n",
+                 (long long)enc, (long long)dec, (long long)(enc - dec), (long long)dup_excess_limit,
+                 octx->fname ? octx->fname : "");
+          ret = lpms_ERR_DUP_FRAMES;
+          goto proc_cleanup;
+        }
+      }
+
+      // Debug: log decoded vs encoded frame counts per output for video
+      if (is_video && frame) {
+        av_log(NULL, AV_LOG_DEBUG,
+               "counts decoded_v=%lld encoded_v=%lld out=%s\n",
+               (long long)octx->dec_video_frames,
+               (long long)octx->res->frames,
+               octx->fname ? octx->fname : "");
+      }
+
       // Abort further processing if output size limit is exceeded
       if (ret == lpms_ERR_OUTPUT_SIZE) {
         av_frame_unref(frame);
@@ -682,4 +716,3 @@ skip:
 proc_cleanup:
   return ret;
 }
-

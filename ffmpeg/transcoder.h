@@ -18,6 +18,7 @@ extern const int lpms_ERR_FILTER_FLUSHED;
 extern const int lpms_ERR_OUTPUTS;
 extern const int lpms_ERR_UNRECOVERABLE;
 extern const int lpms_ERR_OUTPUT_SIZE;
+extern const int lpms_ERR_DUP_FRAMES;
 
 struct transcode_thread;
 

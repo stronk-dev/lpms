@@ -9,6 +9,7 @@
 #include <libavutil/pixdesc.h>
 
 #include <assert.h>
+#include <libavutil/log.h>
 
 int filtergraph_parser(struct filter_ctx *fctx, char* filters_descr, AVFilterInOut **inputs, AVFilterInOut **outputs)
 {
@@ -71,6 +72,8 @@ int init_video_filters(struct input_ctx *ictx, struct output_ctx *octx, AVFrame 
       vf->graph = avfilter_graph_alloc();
     }
     vf->pts_diff = INT64_MIN;
+    vf->last_src_pts = INT64_MIN;
+    vf->dup_count = 0;
     if (!outputs || !inputs || !vf->graph) {
       ret = AVERROR(ENOMEM);
       LPMS_ERR(vf_init_cleanup, "Unable to allocate filters");
@@ -403,6 +406,30 @@ int filtergraph_read(struct input_ctx *ictx, struct output_ctx *octx, struct fil
         filter->pts_diff = pts - frame->pts;
       }
       frame->pts += filter->pts_diff; // Re-calculate by adding back this segment's difference calculated at start
+
+      // Track duplication of source frame PTS through fps filter
+      int64_t src_pts = (int64_t)frame->opaque; // original input PTS (pre-filter timebase)
+      if (filter->last_src_pts == src_pts) {
+        filter->dup_count++;
+      } else {
+        filter->last_src_pts = src_pts;
+        filter->dup_count = 1;
+      }
+      av_log(NULL, AV_LOG_DEBUG,
+             "fps src_pts=%lld out_pts=%lld dup_count=%lld\n",
+             (long long)src_pts, (long long)frame->pts, (long long)filter->dup_count);
+
+      // Abort if duplicate count exceeds a conservative threshold
+      // Threshold: max(10000, fps * 60 seconds)
+      int64_t dup_limit = ((int64_t)octx->fps.num * 60) / (octx->fps.den ? octx->fps.den : 1);
+      if (dup_limit < 10000) dup_limit = 10000;
+      if (filter->dup_count > dup_limit) {
+        av_log(NULL, AV_LOG_ERROR,
+               "Aborting due to excessive duplicate frames: dup_count=%lld limit=%lld (fps=%d/%d)\n",
+               (long long)filter->dup_count, (long long)dup_limit, octx->fps.num, octx->fps.den);
+        ret = lpms_ERR_DUP_FRAMES;
+        goto fg_read_cleanup;
+      }
     }
 fg_read_cleanup:
     return ret;

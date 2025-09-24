@@ -21,6 +21,7 @@ const int lpms_ERR_FILTER_FLUSHED = FFERRTAG('F','L','F','L');
 const int lpms_ERR_OUTPUTS = FFERRTAG('O','U','T','P');
 const int lpms_ERR_UNRECOVERABLE = FFERRTAG('U', 'N', 'R', 'V');
 const int lpms_ERR_OUTPUT_SIZE = FFERRTAG('O','U','S','Z');
+const int lpms_ERR_DUP_FRAMES = FFERRTAG('D','U','P','F');
 
 //
 //  Notes on transcoder internals:
@@ -238,6 +239,7 @@ int transcode_init(struct transcode_thread *h, input_params *inp,
     octx->dv = ictx->vi < 0 || is_drop(octx->video->name);
     octx->da = ictx->ai < 0 || is_drop(octx->audio->name);
     octx->res = &results[i];
+    octx->dec_video_frames = 0; // reset per-call decoded video counter for this output
     octx->initialized = h->initialized && (AV_HWDEVICE_TYPE_NONE != octx->hw_type || ictx->transmuxing);
 
     // either first segment of a GPU stream or a CPU stream
@@ -325,6 +327,8 @@ int transcode(struct transcode_thread *h,
   struct input_ctx *ictx = &h->ictx;
   struct output_ctx *outputs = h->outputs;
   int nb_outputs = h->nb_outputs;
+
+  // Reset per-segment decoded frames counter
   int outputs_ready = 0, hit_eof = 0;
 
   ipkt = av_packet_alloc();
@@ -542,6 +546,9 @@ int transcode(struct transcode_thread *h,
       else if (ret == lpms_ERR_OUTPUT_SIZE) {
         // Muxer throws this error if it detects abnormal output size growth compared to input size
         LPMS_ERR(transcode_cleanup, "Output size limit exceeded");
+      }
+      else if (ret == lpms_ERR_DUP_FRAMES) {
+        LPMS_ERR(transcode_cleanup, "Excessive duplicate frames detected");
       }
       else if (ret < 0) LPMS_ERR(transcode_cleanup, "Error encoding");
     }

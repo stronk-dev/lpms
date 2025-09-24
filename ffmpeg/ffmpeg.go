@@ -22,6 +22,7 @@ import (
 )
 
 // #cgo pkg-config: libavformat libavfilter libavcodec libavutil libswscale
+// #cgo LDFLAGS: -lm
 // #include <stdlib.h>
 // #include "transcoder.h"
 // #include "extras.h"

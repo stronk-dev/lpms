@@ -43,6 +43,10 @@ struct filter_ctx {
   // We mark this boolean as flushed when done flushing.
   int flushed;
   int flushing;
+
+  // Track duplication of source frames through fps filter
+  int64_t last_src_pts;
+  int64_t dup_count;
 };
 
 struct output_ctx {
@@ -83,6 +87,9 @@ struct output_ctx {
   int64_t output_bytes_written;
   int64_t input_file_size;
   int64_t max_output_size;
+
+  // Count of decoded video frames fed into this output (per segment)
+  int64_t dec_video_frames;
 
   output_results  *res; // data to return for this output
   char *xcoderParams;
