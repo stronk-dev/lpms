@@ -4,6 +4,8 @@
 
 #include <libavfilter/buffersrc.h>
 #include <libavfilter/buffersink.h>
+#include <libavfilter/version.h>
+#include <libavfilter/version.h>
 
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
@@ -56,7 +58,9 @@ int init_video_filters(struct input_ctx *ictx, struct output_ctx *octx, AVFrame 
     AVFilterInOut *outputs = NULL;
     AVFilterInOut *inputs  = NULL;
     AVRational time_base = ictx->ic->streams[ictx->vi]->time_base;
+#if LIBAVFILTER_VERSION_MAJOR < 11
     enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_CUDA, AV_PIX_FMT_NONE }; // XXX ensure the encoder allows this
+#endif
     struct filter_ctx *vf = &octx->vf;
     char *filters_descr = octx->vfilters;
     enum AVPixelFormat in_pix_fmt = ictx->vc->pix_fmt;
@@ -100,6 +104,22 @@ int init_video_filters(struct input_ctx *ictx, struct output_ctx *octx, AVFrame 
     }
 
     /* buffer video sink: to terminate the filter chain. */
+#if LIBAVFILTER_VERSION_MAJOR >= 11
+    const char *sw_pix = av_get_pix_fmt_name(AV_PIX_FMT_YUV420P);
+    char sink_args[64];
+    if (ictx->vc && ictx->vc->hw_frames_ctx) {
+      enum AVPixelFormat hw_fmt = hw2pixfmt(ictx->vc);
+      const char *hw_pix = av_get_pix_fmt_name(hw_fmt);
+      if (!hw_pix || !*hw_pix) hw_pix = "cuda";
+      if (!sw_pix || !*sw_pix) sw_pix = "yuv420p";
+      snprintf(sink_args, sizeof sink_args, "pixel_formats=%s|%s", sw_pix, hw_pix);
+    } else {
+      if (!sw_pix || !*sw_pix) sw_pix = "yuv420p";
+      snprintf(sink_args, sizeof sink_args, "pixel_formats=%s", sw_pix);
+    }
+    ret = avfilter_graph_create_filter(&vf->sink_ctx, buffersink,
+                                       "out", sink_args, NULL, vf->graph);
+#else
     ret = avfilter_graph_create_filter(&vf->sink_ctx, buffersink,
                                        "out", NULL, NULL, vf->graph);
     if (ret < 0) LPMS_ERR(vf_init_cleanup, "Cannot create video buffer sink");
@@ -107,6 +127,8 @@ int init_video_filters(struct input_ctx *ictx, struct output_ctx *octx, AVFrame 
     ret = av_opt_set_int_list(vf->sink_ctx, "pix_fmts", pix_fmts,
                               AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
     if (ret < 0) LPMS_ERR(vf_init_cleanup, "Cannot set output pixel format");
+#endif
+    if (ret < 0) LPMS_ERR(vf_init_cleanup, "Cannot create video buffer sink");
 
     ret = filtergraph_parser(vf, filters_descr, &inputs, &outputs);
     if (ret < 0) LPMS_ERR(vf_init_cleanup, "Unable to parse video filters desc");
@@ -210,7 +232,9 @@ int init_signature_filters(struct output_ctx *octx, AVFrame *inf)
     AVFilterInOut *outputs = NULL;
     AVFilterInOut *inputs  = NULL;
     AVRational time_base = octx->oc->streams[0]->time_base;
+#if LIBAVFILTER_VERSION_MAJOR < 11
     enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_CUDA, AV_PIX_FMT_NONE }; // XXX ensure the encoder allows this
+#endif
     struct filter_ctx *sf = &octx->sf;
     char *filters_descr = octx->sfilters;
     enum AVPixelFormat in_pix_fmt = octx->vc->pix_fmt;
@@ -256,6 +280,22 @@ int init_signature_filters(struct output_ctx *octx, AVFrame *inf)
     }
 
     /* buffer video sink: to terminate the filter chain. */
+#if LIBAVFILTER_VERSION_MAJOR >= 11
+    const char *sig_sw_pix = av_get_pix_fmt_name(AV_PIX_FMT_YUV420P);
+    char sig_sink_args[64];
+    if (octx->vc && octx->vc->hw_frames_ctx) {
+      enum AVPixelFormat sig_hw_fmt = hw2pixfmt(octx->vc);
+      const char *sig_hw_pix = av_get_pix_fmt_name(sig_hw_fmt);
+      if (!sig_hw_pix || !*sig_hw_pix) sig_hw_pix = "cuda";
+      if (!sig_sw_pix || !*sig_sw_pix) sig_sw_pix = "yuv420p";
+      snprintf(sig_sink_args, sizeof sig_sink_args, "pixel_formats=%s|%s", sig_sw_pix, sig_hw_pix);
+    } else {
+      if (!sig_sw_pix || !*sig_sw_pix) sig_sw_pix = "yuv420p";
+      snprintf(sig_sink_args, sizeof sig_sink_args, "pixel_formats=%s", sig_sw_pix);
+    }
+    ret = avfilter_graph_create_filter(&sf->sink_ctx, buffersink,
+                                       "out", sig_sink_args, NULL, sf->graph);
+#else
     ret = avfilter_graph_create_filter(&sf->sink_ctx, buffersink,
                                        "out", NULL, NULL, sf->graph);
     if (ret < 0) LPMS_ERR(sf_init_cleanup, "Cannot create video buffer sink");
@@ -263,6 +303,8 @@ int init_signature_filters(struct output_ctx *octx, AVFrame *inf)
     ret = av_opt_set_int_list(sf->sink_ctx, "pix_fmts", pix_fmts,
                               AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
     if (ret < 0) LPMS_ERR(sf_init_cleanup, "Cannot set output pixel format");
+#endif
+    if (ret < 0) LPMS_ERR(sf_init_cleanup, "Cannot create video buffer sink");
 
     ret = filtergraph_parser(sf, filters_descr, &inputs, &outputs);
     if (ret < 0) LPMS_ERR(sf_init_cleanup, "Unable to parse signature filters desc");

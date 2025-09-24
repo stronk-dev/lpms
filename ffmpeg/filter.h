@@ -73,6 +73,16 @@ struct output_ctx {
   int64_t last_audio_dts;     //dts of the last audio packet sent to the muxer
 
   int64_t last_video_dts;     //dts of the last video packet sent to the muxer
+  int64_t last_video_pts;     //pts of the last video packet sent to the muxer
+  int64_t last_video_src_pts; //last monotonic pts tracked in source timebase
+  int64_t src_pts_bias;       //cumulative adjustment applied to source pts
+
+  // Monotonic timestamp generator when encoding without B-frames
+  int64_t video_pts_step;
+  int have_source_pts;
+  int64_t prev_source_pts;
+  int64_t base_source_pts;
+  AVRational video_input_tb;
 
   int64_t gop_time, gop_pts_len, next_kf_pts; // for gop reset
 

@@ -4,6 +4,126 @@
 #include <libavcodec/avcodec.h>
 #include <libavfilter/buffersrc.h>
 #include <libavfilter/buffersink.h>
+#include <libavformat/version.h>
+#include <inttypes.h>
+
+#if LIBAVFORMAT_VERSION_MAJOR >= 62
+static void copy_stream_timing_info(const AVOutputFormat *ofmt, AVStream *ost, const AVStream *ist)
+{
+  (void)ofmt;
+  if (!ost || !ist) return;
+
+  ost->start_time = ist->start_time;
+  ost->duration = ist->duration;
+  ost->nb_frames = ist->nb_frames;
+  ost->disposition = ist->disposition;
+  ost->sample_aspect_ratio = ist->sample_aspect_ratio;
+  ost->avg_frame_rate = ist->avg_frame_rate;
+  ost->r_frame_rate = ist->r_frame_rate;
+  ost->pts_wrap_bits = ist->pts_wrap_bits;
+}
+#endif
+
+static void init_monotonic_state(struct output_ctx *octx, AVCodecContext *vc, struct input_ctx *ictx)
+{
+  octx->video_pts_step = 0;
+  octx->have_source_pts = 0;
+  octx->prev_source_pts = 0;
+  octx->base_source_pts = 0;
+  octx->last_video_pts = AV_NOPTS_VALUE;
+  octx->last_video_src_pts = AV_NOPTS_VALUE;
+  octx->src_pts_bias = 0;
+  if (ictx && ictx->vi >= 0) {
+    octx->video_input_tb = ictx->ic->streams[ictx->vi]->time_base;
+  } else {
+    octx->video_input_tb = vc->time_base;
+  }
+
+  if (vc->max_b_frames == 0) {
+    AVRational enc_rate = vc->framerate.num && vc->framerate.den ? vc->framerate
+                             : (ictx && ictx->vi >= 0 ? ictx->ic->streams[ictx->vi]->r_frame_rate : vc->framerate);
+    if (enc_rate.num && enc_rate.den) {
+      octx->video_pts_step = av_rescale_q_rnd(1, av_inv_q(enc_rate), vc->time_base,
+                                              AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+    }
+    if (!octx->video_pts_step && vc->time_base.num) {
+      octx->video_pts_step = 1;
+    }
+  }
+}
+
+static void assign_monotonic_pts(struct output_ctx *octx, AVCodecContext *encoder,
+                                 int64_t source_pts, AVFrame *frame)
+{
+  if (!frame) return;
+
+  AVRational src_tb = octx->video_input_tb;
+  if (!src_tb.num || !src_tb.den) src_tb = encoder->time_base;
+
+  int first_frame = !octx->have_source_pts;
+  if (first_frame) {
+    octx->base_source_pts = source_pts;
+    octx->prev_source_pts = source_pts;
+    octx->have_source_pts = 1;
+    octx->last_video_pts = AV_NOPTS_VALUE;
+    octx->last_video_src_pts = AV_NOPTS_VALUE;
+  }
+
+  int64_t min_step_enc = octx->video_pts_step;
+  if (min_step_enc <= 0 && encoder->time_base.num) {
+    min_step_enc = 1;
+    octx->video_pts_step = min_step_enc;
+  }
+
+  int64_t min_step_src = 0;
+  if (min_step_enc > 0 && src_tb.num && src_tb.den) {
+    min_step_src = av_rescale_q_rnd(min_step_enc, encoder->time_base, src_tb,
+                                    AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+  }
+  if (min_step_src <= 0) min_step_src = 1;
+
+  int64_t rel_src = source_pts - octx->base_source_pts;
+  if (rel_src < 0) rel_src = 0;
+
+  if (first_frame) octx->src_pts_bias = 0;
+
+  int64_t monotonic_src = rel_src + octx->src_pts_bias;
+  int64_t last_src = octx->last_video_src_pts;
+  if (last_src != AV_NOPTS_VALUE) {
+    int64_t desired = last_src + min_step_src;
+    if (monotonic_src < desired) {
+      int64_t need = desired - monotonic_src;
+      monotonic_src += need;
+      octx->src_pts_bias += need;
+    } else if (octx->src_pts_bias > 0) {
+      int64_t slack = monotonic_src - desired;
+      if (slack > 0) {
+        int64_t reduce = FFMIN(octx->src_pts_bias, slack);
+        monotonic_src -= reduce;
+        octx->src_pts_bias -= reduce;
+      }
+    }
+  }
+
+  int64_t step_src = (last_src == AV_NOPTS_VALUE) ? min_step_src : monotonic_src - last_src;
+  if (step_src < min_step_src) step_src = min_step_src;
+
+  int64_t scaled_pts = av_rescale_q_rnd(monotonic_src, src_tb, encoder->time_base,
+                                        AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+  int64_t step_enc = av_rescale_q_rnd(step_src, src_tb, encoder->time_base,
+                                      AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+  if (step_enc <= 0) step_enc = min_step_enc > 0 ? min_step_enc : 1;
+
+  if (octx->last_video_pts != AV_NOPTS_VALUE && scaled_pts <= octx->last_video_pts) {
+    scaled_pts = octx->last_video_pts + step_enc;
+  }
+
+  frame->pts = scaled_pts;
+  frame->duration = step_enc;
+  octx->last_video_pts = scaled_pts;
+  octx->last_video_src_pts = monotonic_src;
+  octx->prev_source_pts = source_pts;
+}
 
 static int add_video_stream(struct output_ctx *octx, struct input_ctx *ictx)
 {
@@ -22,7 +142,11 @@ static int add_video_stream(struct output_ctx *octx, struct input_ctx *ictx)
     if (ret < 0) LPMS_ERR(add_video_err, "Error copying video params from input stream");
     // Sometimes the codec tag is wonky for some reason, so correct it
     ret = av_codec_get_tag2(octx->oc->oformat->codec_tag, st->codecpar->codec_id, &st->codecpar->codec_tag);
+#if LIBAVFORMAT_VERSION_MAJOR < 62
     avformat_transfer_internal_stream_timing_info(octx->oc->oformat, st, ist, AVFMT_TBCF_DEMUXER);
+#else
+    copy_stream_timing_info(octx->oc->oformat, st, ist);
+#endif
   } else if (octx->vc) {
     st->time_base = octx->vc->time_base;
     ret = avcodec_parameters_from_context(st->codecpar, octx->vc);
@@ -74,7 +198,11 @@ static int add_audio_stream(struct input_ctx *ictx, struct output_ctx *octx)
     if (ret < 0) LPMS_ERR(add_audio_err, "Error copying audio params from input stream");
     // Sometimes the codec tag is wonky for some reason, so correct it
     ret = av_codec_get_tag2(octx->oc->oformat->codec_tag, st->codecpar->codec_id, &st->codecpar->codec_tag);
+#if LIBAVFORMAT_VERSION_MAJOR < 62
     avformat_transfer_internal_stream_timing_info(octx->oc->oformat, st, ist, AVFMT_TBCF_DEMUXER);
+#else
+    copy_stream_timing_info(octx->oc->oformat, st, ist);
+#endif
   } else if (octx->ac) {
     st->time_base = octx->ac->time_base;
     ret = avcodec_parameters_from_context(st->codecpar, octx->ac);
@@ -197,8 +325,12 @@ int open_remux_output(struct input_ctx *ictx, struct output_ctx *octx)
     // Sometimes the codec tag is wonky for some reason, so correct it
     ret = av_codec_get_tag2(octx->oc->oformat->codec_tag,
                             st->codecpar->codec_id, &st->codecpar->codec_tag);
+#if LIBAVFORMAT_VERSION_MAJOR < 62
     avformat_transfer_internal_stream_timing_info(octx->oc->oformat, st, ist,
                                                   AVFMT_TBCF_DEMUXER);
+#else
+    copy_stream_timing_info(octx->oc->oformat, st, ist);
+#endif
 
   }
   return 0;
@@ -240,9 +372,18 @@ int open_output(struct output_ctx *octx, struct input_ctx *ictx)
     if (octx->fps.den) vc->framerate = av_buffersink_get_frame_rate(octx->vf.sink_ctx);
     else if (ictx->vc->framerate.num && ictx->vc->framerate.den) vc->framerate = ictx->vc->framerate;
     else vc->framerate = ictx->ic->streams[ictx->vi]->r_frame_rate;
-    if (octx->fps.den) vc->time_base = av_buffersink_get_time_base(octx->vf.sink_ctx);
-    else if (ictx->vc->framerate.num && ictx->vc->framerate.den) vc->time_base = av_inv_q(ictx->vc->framerate);
-    else vc->time_base = ictx->ic->streams[ictx->vi]->time_base;
+    if (octx->fps.den) {
+      vc->time_base = av_buffersink_get_time_base(octx->vf.sink_ctx);
+    } else {
+      AVRational src_tb = ictx->ic->streams[ictx->vi]->time_base;
+      if (!src_tb.num || !src_tb.den) {
+        if (ictx->vc->framerate.num && ictx->vc->framerate.den) src_tb = av_inv_q(ictx->vc->framerate);
+        else if (octx->vf.active && octx->vf.sink_ctx) src_tb = av_buffersink_get_time_base(octx->vf.sink_ctx);
+        else if (vc->framerate.num && vc->framerate.den) src_tb = av_inv_q(vc->framerate);
+        else src_tb = (AVRational){1, 90000};
+      }
+      vc->time_base = src_tb;
+    }
     vc->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
     if (octx->bitrate) vc->rc_min_rate = vc->bit_rate = vc->rc_max_rate = vc->rc_buffer_size = octx->bitrate;
     if (av_buffersink_get_hw_frames_ctx(octx->vf.sink_ctx)) {
@@ -261,6 +402,8 @@ int open_output(struct output_ctx *octx, struct input_ctx *ictx)
     ret = avcodec_open2(vc, codec, &opts);
     if (opts) av_dict_free(&opts);
     if (ret < 0) LPMS_ERR(open_output_err, "Error opening video encoder");
+
+    init_monotonic_state(octx, vc, ictx);
     octx->hw_type = ictx->hw_type;
   }
 
@@ -318,6 +461,7 @@ int reopen_output(struct output_ctx *octx, struct input_ctx *ictx)
   if (octx->vc) {
     ret = add_video_stream(octx, ictx);
     if (ret < 0) LPMS_ERR(reopen_out_err, "Unable to re-add video stream");
+    init_monotonic_state(octx, octx->vc, ictx);
   } else LPMS_INFO("No video stream!?");
 
   // re-attach audio encoder
@@ -449,7 +593,7 @@ int encode(AVCodecContext* encoder, AVFrame *frame, struct output_ctx* octx, AVS
     if (AVERROR(EAGAIN) == ret || AVERROR_EOF == ret) goto encode_cleanup;
     if (ret < 0) LPMS_ERR(encode_cleanup, "Error receiving packet from encoder");
     AVRational time_base = encoder->time_base;
-    if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type && !octx->fps.den && octx->vf.active) {
+    if (AVMEDIA_TYPE_VIDEO == ost->codecpar->codec_type && !octx->fps.den && octx->vf.active && encoder->max_b_frames > 0) {
       // try to preserve source timestamps for fps passthrough.
       time_base = octx->vf.time_base;
       int64_t pts_dts_diff = pkt->pts - pkt->dts;
@@ -544,6 +688,10 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
   if (!encoder) LPMS_ERR(proc_cleanup, "Trying to transmux; not supported")
 
   if (!filter || !filter->active) {
+    if (inf && ost->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && encoder->max_b_frames == 0) {
+      int64_t orig_pts = (int64_t)(inf->opaque);
+      assign_monotonic_pts(octx, encoder, orig_pts, inf);
+    }
     // No filter in between decoder and encoder, so use input frame directly
     return encode(encoder, inf, octx, ost);
   }
@@ -625,6 +773,11 @@ int process_out(struct input_ctx *ictx, struct output_ctx *octx, AVCodecContext 
         }
       }
 
+      if (frame && is_video && encoder->max_b_frames == 0) {
+        int64_t orig_pts = (int64_t)frame->opaque;
+        assign_monotonic_pts(octx, encoder, orig_pts, frame);
+      }
+
       ret = encode(encoder, frame, octx, ost);
 skip:
     av_frame_unref(frame);
@@ -639,4 +792,3 @@ skip:
 proc_cleanup:
   return ret;
 }
-
