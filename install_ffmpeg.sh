@@ -191,13 +191,34 @@ EXTRA_FFMPEG_LDFLAGS="$EXTRA_LDFLAGS"
 # all flags which should be present for production build, but should be replaced/removed for debug build
 DEV_FFMPEG_FLAGS=""
 
+# Detect CUDA install path. Distros differ:
+#   /usr/local/cuda - upstream NVIDIA tarball, Ubuntu / Debian
+#   /opt/cuda       - Arch Linux convention
+CUDA_PATH="${CUDA_PATH:-}"
+if [[ -z "$CUDA_PATH" ]]; then
+  for cand in /usr/local/cuda /opt/cuda; do
+    if [[ -e "$cand/lib64" ]]; then
+      CUDA_PATH="$cand"
+      break
+    fi
+  done
+fi
+
 if [[ "$BUILDOS" == "darwin" && "$GOOS" == "darwin" ]]; then
   EXTRA_FFMPEG_LDFLAGS="$EXTRA_FFMPEG_LDFLAGS -framework CoreFoundation -framework Security"
 elif [[ "$GOOS" == "windows" ]]; then
   EXTRA_FFMPEG_FLAGS="$EXTRA_FFMPEG_FLAGS --enable-cuda --enable-cuda-llvm --enable-cuvid --enable-nvenc --enable-decoder=h264_cuvid,hevc_cuvid,vp8_cuvid,vp9_cuvid --enable-filter=scale_cuda,signature_cuda,hwupload_cuda --enable-encoder=h264_nvenc,hevc_nvenc"
-elif [[ -e "/usr/local/cuda/lib64" ]]; then
-  echo "CUDA SDK detected, building with GPU support"
-  EXTRA_FFMPEG_FLAGS="$EXTRA_FFMPEG_FLAGS --enable-nonfree --enable-cuda-nvcc --enable-libnpp --enable-cuda --enable-cuda-llvm --enable-cuvid --enable-nvenc --enable-decoder=h264_cuvid,hevc_cuvid,vp8_cuvid,vp9_cuvid --enable-filter=scale_npp,signature_cuda,hwupload_cuda --enable-encoder=h264_nvenc,hevc_nvenc"
+elif [[ -n "$CUDA_PATH" ]]; then
+  echo "CUDA SDK detected at $CUDA_PATH, building with GPU support"
+  # CUDA 13 dropped the NPP-based ffmpeg filters (scale_npp). Use scale_cuda
+  # and drop libnpp from the build. cuda_nvcc still needs --enable-nonfree
+  # because NVIDIA's nvcc license isn't GPL-compatible.
+  # CUDA 13 also dropped compute_60 (Pascal); minimum supported is sm_75
+  # (Turing). Override ffmpeg's default nvcc arch via FFMPEG_NVCC_ARCH; the
+  # configure invocation below picks this up as a separately-quoted arg.
+  FFMPEG_NVCC_ARCH="${FFMPEG_NVCC_ARCH:-compute_75}"
+  FFMPEG_NVCC_SM="${FFMPEG_NVCC_SM:-sm_75}"
+  EXTRA_FFMPEG_FLAGS="$EXTRA_FFMPEG_FLAGS --enable-nonfree --enable-cuda-nvcc --enable-cuda --enable-cuda-llvm --enable-cuvid --enable-nvenc --enable-decoder=h264_cuvid,hevc_cuvid,vp8_cuvid,vp9_cuvid --enable-filter=scale_cuda,signature_cuda,hwupload_cuda --enable-encoder=h264_nvenc,hevc_nvenc"
 else
   echo "No CUDA SDK detected, building without GPU support"
 fi
@@ -228,9 +249,10 @@ if [[ ! -e "$ROOT/ffmpeg/libavcodec/libavcodec.a" ]]; then
     --enable-filter=aresample,asetnsamples,fps,scale,hwdownload,select,livepeer_dnn,signature \
     --enable-encoder=mp3,vorbis,flac,aac,opus,libx264 \
     --enable-decoder=mp3,vorbis,flac,aac,opus,h264,png \
-    --extra-cflags="${EXTRA_CFLAGS} -I${ROOT}/compiled/include -I/usr/local/cuda/include" \
-    --extra-ldflags="${EXTRA_FFMPEG_LDFLAGS} -L${ROOT}/compiled/lib -L/usr/local/cuda/lib64" \
+    --extra-cflags="${EXTRA_CFLAGS} -I${ROOT}/compiled/include ${CUDA_PATH:+-I${CUDA_PATH}/include}" \
+    --extra-ldflags="${EXTRA_FFMPEG_LDFLAGS} -L${ROOT}/compiled/lib ${CUDA_PATH:+-L${CUDA_PATH}/lib64}" \
     --prefix="$ROOT/compiled" \
+    --nvccflags="-gencode arch=${FFMPEG_NVCC_ARCH:-compute_75},code=${FFMPEG_NVCC_SM:-sm_75} -O2 -std=c++11 -m64 -ptx" \
     $EXTRA_FFMPEG_FLAGS \
     $DEV_FFMPEG_FLAGS || (tail -100 ${ROOT}/ffmpeg/ffbuild/config.log && exit 1)
   # If configure fails, then print the last 100 log lines for debugging and exit.

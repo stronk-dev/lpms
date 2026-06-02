@@ -9,7 +9,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -643,7 +642,7 @@ func createCOutputParams(input *TranscodeOptionsIn, ps []TranscodeOptions) ([]C.
 		}
 		if p.Accel == Nvidia && filepath.Ext(input.Fname) == ".png" {
 			// If the input is PNG image(s) and we are scaling on a Nvidia device
-			// we need to first convert to a pixel format that the scale_npp filter supports
+			// we need to first convert to a pixel format that the scale_cuda filter supports
 			filters = "format=nv12," + filters
 		}
 		// set FPS denominator to 1 if unset by user
@@ -1115,21 +1114,17 @@ func ffmpegStrEscape(origStr string) string {
 }
 
 func hwScale() string {
-	if runtime.GOOS == "windows" {
-		// we don't build windows binaries with CUDA SDK, so need to use scale_cuda instead of scale_npp
-		return "scale_cuda"
-	} else {
-		return "scale_npp"
-	}
+	// CUDA 13 dropped the NPP-based scale_npp filter (NPP libs were the
+	// proprietary CUDA component, removed/restructured upstream). Use
+	// scale_cuda on all platforms; it does not depend on libnpp.
+	return "scale_cuda"
 }
 
 func hwScaleAlgo() string {
-	if runtime.GOOS == "windows" {
-		// we don't build windows binaries with CUDA SDK, so need to use the default scale algorithm
-		return ""
-	} else {
-		return "super"
-	}
+	// scale_cuda accepts nearest/bilinear/bicubic/lanczos for interp_algo;
+	// none map cleanly to scale_npp's "super". Empty lets ffmpeg pick the
+	// default (bilinear).
+	return ""
 }
 
 func FfmpegSetLogLevel(level int) {
